@@ -3,9 +3,10 @@ import json
 import re
 import requests
 import base64
+from datetime import datetime
 from dotenv import load_dotenv
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 import asyncio
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
@@ -17,7 +18,7 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler("bot_usage.log", encoding="utf-8"),
-        logging.StreamHandler()  # также вывод в консоль
+        logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
@@ -33,9 +34,23 @@ OLLAMA_API_URL = os.getenv("OLLAMA_API_URL", "http://localhost:11434/api/chat")
 MODEL_NAME = os.getenv("MODEL_NAME", "gemma3:4b")
 
 FAQ_PATH = "faq.json"
+CONSULTATIONS_FILE = "consultations.json"
+ADMIN_ID = 1373472999  # Твой Telegram ID
+
 knowledge_base = []
 tfidf_vectorizer = None
 tfidf_matrix = None
+
+# === Ключевые слова для распознавания намерения записаться ===
+SIGNUP_KEYWORDS = {
+    "запис", "консультац", "урок", "занят", "обучен", "курс",
+    "помощь", "настав", "репетитор", "программирован", "python",
+    "начать", "научиться", "индивидуал", "коуч", "ментор", "пробное", "бесплатно"
+}
+
+def is_signup_intent(text: str) -> bool:
+    text = text.lower()
+    return any(kw in text for kw in SIGNUP_KEYWORDS)
 
 # === Стоп-слова для русского (ручной список) ===
 CUSTOM_STOPWORDS = {
@@ -96,7 +111,6 @@ def load_knowledge_base(faq_path: str = "faq.json"):
                 if not context:
                     continue
                 keywords = [kw.lower().strip() for kw in item.get("keywords", []) if kw.strip()]
-                # Предварительная обработка ключевых слов
                 preprocessed_kws = [normalize_text(kw) for kw in keywords]
                 knowledge_base.append({
                     "context": context,
@@ -124,16 +138,13 @@ def retrieve_context(user_question: str, similarity_threshold: float = 0.25, top
     
     matched_contexts = []
 
-    # 1. Поиск по ключевым словам (точное + нечёткое)
     for entry in knowledge_base:
         for prep_kw in entry["preprocessed_kws"]:
             if not prep_kw:
                 continue
-            # Точное вхождение
             if prep_kw in norm_question:
                 if entry["context"] not in matched_contexts:
                     matched_contexts.append(entry["context"])
-            # Нечёткое сходство (Жаккар)
             elif jaccard_similarity(prep_kw, norm_question) >= 0.6:
                 if entry["context"] not in matched_contexts:
                     matched_contexts.append(entry["context"])
@@ -142,7 +153,6 @@ def retrieve_context(user_question: str, similarity_threshold: float = 0.25, top
         full_context = "\n\n".join(matched_contexts)
         return full_context[:700] + "..." if len(full_context) > 700 else full_context
 
-    # 2. TF-IDF поиск (fallback)
     if tfidf_matrix is not None and tfidf_vectorizer is not None:
         query_vec = tfidf_vectorizer.transform([norm_question])
         similarities = cosine_similarity(query_vec, tfidf_matrix).flatten()
@@ -154,7 +164,7 @@ def retrieve_context(user_question: str, similarity_threshold: float = 0.25, top
                 if ctx not in matched_contexts:
                     matched_contexts.append(ctx)
             else:
-                break  # сортировка по убыванию
+                break
         
         if matched_contexts:
             full_context = "\n\n".join(matched_contexts)
@@ -197,6 +207,18 @@ TEACHER_ROLE = (
     "Если тема не относится к указанным — вежливо откажись отвечать."
 )
 
+# === Сохранение заявки ===
+def save_consultation_request(request: dict):
+    requests = []
+    if os.path.exists(CONSULTATIONS_FILE):
+        with open(CONSULTATIONS_FILE, "r", encoding="utf-8") as f:
+            requests = json.load(f)
+    
+    if not any(r["user_id"] == request["user_id"] for r in requests):
+        requests.append(request)
+        with open(CONSULTATIONS_FILE, "w", encoding="utf-8") as f:
+            json.dump(requests, f, ensure_ascii=False, indent=2)
+
 # === Обработчики ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -214,6 +236,26 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_message = update.message.text.strip()
     logger.info(f"User {user.id} sent: {user_message[:50]}{'...' if len(user_message) > 50 else ''}")
     if not user_message:
+        return
+
+    # Обработка команды "заявки" (только для админа)
+    if user.id == ADMIN_ID and user_message.lower() == "заявки":
+        if not os.path.exists(CONSULTATIONS_FILE):
+            await update.message.reply_text("📭 Нет заявок.")
+            return
+        with open(CONSULTATIONS_FILE, "r", encoding="utf-8") as f:
+            requests = json.load(f)
+        pending = [r for r in requests if r.get("status") == "pending"]
+        if not pending:
+            await update.message.reply_text("📭 Нет новых заявок.")
+            return
+        msg = "📥 Новые заявки на консультацию:\n\n"
+        for r in pending[:20]:
+            name = r.get("full_name") or "—"
+            username = f"@{r['username']}" if r.get("username") else f"ID: {r['user_id']}"
+            ts = datetime.fromisoformat(r["timestamp"]).strftime("%d.%m %H:%M")
+            msg += f"• {name} ({username}) — {ts}\n"
+        await update.message.reply_text(msg)
         return
 
     # Быстрая обработка служебных команд
@@ -243,7 +285,34 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await thinking.delete()
     
     context.user_data['chat_history'].append({"role": "assistant", "content": response})
-    await update.message.reply_text(response)
+
+    # Проверяем, хочет ли пользователь записаться
+    if is_signup_intent(user_message):
+        keyboard = [[InlineKeyboardButton("📩 Записаться на консультацию", callback_data="signup")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(response, reply_markup=reply_markup)
+    else:
+        await update.message.reply_text(response)
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+
+    request = {
+        "user_id": user.id,
+        "username": user.username,
+        "full_name": user.full_name,
+        "timestamp": datetime.now().isoformat(),
+        "status": "pending"
+    }
+    save_consultation_request(request)
+
+    await query.edit_message_text(
+        text="✅ Отлично! Ваша заявка на бесплатную 30-минутную консультацию принята.\n\n"
+             "Алексей лично свяжется с вами в Telegram в ближайшее время."
+    )
+    logger.info(f"NEW CONSULTATION REQUEST: {user.id} | @{user.username} | {user.full_name}")
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -281,7 +350,8 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    print("🤖 Бот запущен с поддержкой текста и изображений через Ollama.")
+    application.add_handler(CallbackQueryHandler(button_callback, pattern="^signup$"))
+    print("🤖 Бот запущен с поддержкой записи на консультации.")
     application.run_polling()
 
 if __name__ == "__main__":
