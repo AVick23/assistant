@@ -9,6 +9,18 @@ from telegram import Update
 import asyncio
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+import logging
+
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("bot_usage.log", encoding="utf-8"),
+        logging.StreamHandler()  # также вывод в консоль
+    ]
+)
+logger = logging.getLogger(__name__)
 
 # === Загрузка переменных окружения ===
 load_dotenv()
@@ -187,6 +199,8 @@ TEACHER_ROLE = (
 
 # === Обработчики ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    logger.info(f"User {user.id} ({user.full_name} / @{user.username}) started the bot.")
     await update.message.reply_text(
         "👨‍🏫 Привет! Я — ваш гид по обучению.\n"
         "Задавайте вопросы о курсах, методике или записи на занятия.\n\n"
@@ -196,7 +210,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
     user_message = update.message.text.strip()
+    logger.info(f"User {user.id} sent: {user_message[:50]}{'...' if len(user_message) > 50 else ''}")
     if not user_message:
         return
 
@@ -230,6 +246,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(response)
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    logger.info(f"User {user.id} sent a photo.")
     photo = update.message.photo[-1]
     file = await context.bot.get_file(photo.file_id)
     file_path = f"temp_{photo.file_id}.jpg"
@@ -253,10 +271,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if os.path.exists(file_path):
             os.remove(file_path)
 
-# === Запуск ===
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error("Exception while handling an update:", exc_info=context.error)
+
 def main():
     load_knowledge_base()
     application = Application.builder().token(BOT_TOKEN).build()
+    application.add_error_handler(error_handler)
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
