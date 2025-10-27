@@ -45,7 +45,7 @@ tfidf_matrix = None
 SIGNUP_KEYWORDS = {
     "запис", "консультац", "урок", "занят", "обучен", "курс",
     "помощь", "настав", "репетитор", "программирован", "python",
-    "начать", "научиться", "индивидуал", "коуч", "ментор", "пробное", "бесплатно"
+    "научиться", "ментор", "пробное", "бесплатно"
 }
 
 def is_signup_intent(text: str) -> bool:
@@ -257,6 +257,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg += f"• {name} ({username}) — {ts}\n"
         await update.message.reply_text(msg)
         return
+    
+    elif user_message.lower() == "очистить заявки":
+            if os.path.exists(CONSULTATIONS_FILE):
+                os.remove(CONSULTATIONS_FILE)
+                await update.message.reply_text("✅ Все заявки успешно удалены.")
+            else:
+                await update.message.reply_text("📭 Файл с заявками не найден (уже пуст).")
+            return
 
     # Быстрая обработка служебных команд
     if user_message.lower() in ("очистить", "clear", "сбросить"):
